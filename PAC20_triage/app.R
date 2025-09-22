@@ -1,6 +1,8 @@
+# app.R
 library(shiny)
 library(DT)
 library(plotly)
+library(htmltools)
 
 tier_cols <- c("Tier 1" = "#1f77b4", "Tier 2" = "#ff7f0e", "Tier 3" = "#2ca02c")
 
@@ -9,23 +11,34 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       h3("Input Parameters"),
+      
+      # Party selector
+      selectInput("party", "Select Party:",
+                  choices = c("Con", "Lab", "LD", "Ref", "Grn", "PC", "SNP"),
+                  selected = "Ref"),
+      
       numericInput("total_visits", "Total Visits Available:", value = 400, min = 1, step = 1),
+      numericInput("total_oas", "Total number of OAs in Electoral Division:", value = 320, min = 1, step = 1),
       numericInput("voters_per_oa", "Voters per Output Area:", value = 300, min = 1, step = 1),
       numericInput("response_rate", "Canvassing Response Rate (%):", value = 20, min = 0.1, max = 100, step = 0.1),
       
       hr(),
       h4("Tier 1 (Highest Priority)"),
-      numericInput("tier1_oas", "Number of OAs:", value = 107, min = 0, step = 1),
-      numericInput("tier1_likelihood", "Reform Support Likelihood (%):", value = 45, min = 0, max = 100, step = 0.1),
+      numericInput("tier1_oas", "Number of OAs in Tier 1:", value = 107, min = 0, step = 1),
+      numericInput("tier1_likelihood", "Support Likelihood (%):", value = 45, min = 0, max = 100, step = 0.1),
       
       h4("Tier 2 (Medium Priority)"),
-      numericInput("tier2_oas", "Number of OAs:", value = 107, min = 0, step = 1),
-      numericInput("tier2_likelihood", "Reform Support Likelihood (%):", value = 33, min = 0, max = 100, step = 0.1),
+      numericInput("tier2_oas", "Number of OAs in Tier 2:", value = 107, min = 0, step = 1),
+      numericInput("tier2_likelihood", "Support Likelihood (%):", value = 33, min = 0, max = 100, step = 0.1),
       
       h4("Tier 3 (Lowest Priority)"),
-      checkboxInput("lock_t3", "Set Tier 3 OAs as remainder so T1+T2+T3 = Total Visits", TRUE),
-      numericInput("tier3_oas", "Number of OAs:", value = 106, min = 0, step = 1),
-      numericInput("tier3_likelihood", "Reform Support Likelihood (%):", value = 15, min = 0, max = 100, step = 0.1),
+      checkboxInput("lock_t3", "Set Tier 3 OAs as remainder so T1+T2+T3 = Total OAs", TRUE),
+      numericInput("tier3_oas", "Number of OAs in Tier 3:", value = 106, min = 0, step = 1),
+      numericInput("tier3_likelihood", "Support Likelihood (%):", value = 15, min = 0, max = 100, step = 0.1),
+      
+      hr(),
+      h4("Pass Settings"),
+      numericInput("max_passes_per_oa", "Max passes per OA (cap):", value = 5, min = 1, step = 1),
       
       hr(),
       actionButton("optimize", "Optimize Allocation", class = "btn-primary")
@@ -58,68 +71,80 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
-  # Keep Tier 3 as remainder if requested
-  observeEvent(list(input$total_visits, input$tier1_oas, input$tier2_oas, input$lock_t3), {
+  # Keep Tier 3 as remainder of TOTAL OAs
+  observeEvent(list(input$total_oas, input$tier1_oas, input$tier2_oas, input$lock_t3), {
     if (isTRUE(input$lock_t3)) {
-      remainder <- max(0, input$total_visits - input$tier1_oas - input$tier2_oas)
+      remainder <- max(0, input$total_oas - input$tier1_oas - input$tier2_oas)
       if (!identical(remainder, input$tier3_oas)) {
         updateNumericInput(session, "tier3_oas", value = remainder)
       }
     }
   }, ignoreInit = TRUE)
   
-  # Core optimizer: select top-V marginal returns with diminishing per-OA returns
+  # ========================
+  # Optimizer (eventReactive)
+  # ========================
   optimization_results <- eventReactive(input$optimize, {
-    V  <- as.integer(input$total_visits)
-    N  <- as.numeric(input$voters_per_oa)
-    r  <- as.numeric(input$response_rate)/100
+    V    <- as.integer(input$total_visits)
+    Otot <- as.integer(input$total_oas)
+    N    <- as.numeric(input$voters_per_oa)
+    r    <- as.numeric(input$response_rate)/100
+    Kcap <- as.integer(max(1, input$max_passes_per_oa))
     
     tiers <- data.frame(
       tier       = c("Tier 1","Tier 2","Tier 3"),
-      num_oas    = c(input$tier1_oas, input$tier2_oas, input$tier3_oas),
+      num_oas    = pmax(0L, c(input$tier1_oas, input$tier2_oas, input$tier3_oas)),
       likelihood = c(input$tier1_likelihood, input$tier2_likelihood, input$tier3_likelihood),
       stringsAsFactors = FALSE
     )
     
-    # Supporters per OA in each tier
+    # Consistency note
+    sum_oas <- sum(tiers$num_oas)
+    status_prefix <- if (sum_oas != Otot)
+      sprintf("Note: Tier OAs total (%d) != Total OAs (%d). Using entered tier values. ", sum_oas, Otot)
+    else "OK. "
+    
+    # Expected supporters per OA per tier
     tiers$S <- N * (tiers$likelihood/100)
     
     total_oas <- sum(tiers$num_oas)
     if (total_oas == 0 || V == 0 || r <= 0) {
-      tiers$visits_allocated <- 0
+      tiers$visits_allocated <- 0L
       tiers$total_voters_found <- 0
+      pass_dist <- setNames(vector("list", 3), tiers$tier)
+      for (tr in tiers$tier) pass_dist[[tr]] <- integer(Kcap+1)
       return(list(
-        tiers = tiers, selected_sequence = numeric(0),
-        per_tier_k = list("Tier 1"=integer(0),"Tier 2"=integer(0),"Tier 3"=integer(0)),
-        total_visits_used = 0, total_voters_found = 0, status = "No capacity or zero response rate."
+        tiers = tiers,
+        pass_distributions = pass_dist,
+        selected_sequence = numeric(0),
+        total_visits_used = 0,
+        total_voters_found = 0,
+        status = paste0(status_prefix, "No capacity or zero response rate."),
+        Kmax = Kcap,
+        Otot = Otot
       ))
     }
     
-    # How many passes do we need available? (ensure >= V slots in total)
-    Kmax <- max(1, ceiling(V / max(1, total_oas)) + 2)  # a little headroom
-    # Precompute marginal for pass k (k=1..Kmax) per tier
-    # marginal_{t,k} = S_t * r * (1-r)^(k-1); handle r==1 safely
+    Kmax <- Kcap
     pow_vec <- if (r < 1) (1 - r)^(0:(Kmax-1)) else c(1, rep(0, Kmax-1))
     
-    # Build rows (WITHOUT replicating per-OA). Each row has capacity = num_oas.
+    # Build pass "slots" per tier; each pass k has capacity = number of OAs in that tier
     slots <- do.call(rbind, lapply(1:nrow(tiers), function(i) {
       data.frame(
         tier = tiers$tier[i],
         k    = 1:Kmax,
-        marginal = tiers$S[i] * r * pow_vec,
+        marginal = tiers$S[i] * r * pow_vec,   # expected new voters on k-th pass
         capacity = tiers$num_oas[i]
       )
     }))
     
-    # Sort by marginal desc (higher returns first); tie-break on lower k first
+    # Sort slots by marginal return (desc), break ties by lower pass k
     slots <- slots[order(-slots$marginal, slots$k), ]
     
-    # Allocate visits across these rows with stacking constraint:
-    # For a given tier, cannot allocate more k-th visits than (# of (k-1)-th visits allocated).
-    # Track how many "at least k" visits we have per tier.
-    tiers_k_alloc <- lapply(setNames(tiers$tier, tiers$tier), function(x) integer(Kmax))
+    # Stacking constraint per tier: c_{t,k} <= c_{t,k-1}; c_{t,0} = num_oas
+    per_tier_k <- lapply(setNames(tiers$tier, tiers$tier), function(x) integer(Kmax))
     remaining <- V
-    selected_sequence <- numeric(0)  # the ordered marginal returns actually chosen (for plotting)
+    selected_sequence <- numeric(0)
     
     for (row_i in seq_len(nrow(slots))) {
       if (remaining <= 0) break
@@ -127,128 +152,189 @@ server <- function(input, output, session) {
       kk  <- slots$k[row_i]
       cap <- slots$capacity[row_i]
       
-      # Max we can allocate for this row
       if (kk == 1) {
-        already1 <- tiers_k_alloc[[tr]][1]
-        cap <- max(0, cap - already1)
+        cap <- max(0, cap - per_tier_k[[tr]][1])
       } else {
-        cap <- min(cap, tiers_k_alloc[[tr]][kk-1] - tiers_k_alloc[[tr]][kk])
+        cap <- min(cap, per_tier_k[[tr]][kk-1] - per_tier_k[[tr]][kk])
         cap <- max(0, cap)
       }
       
       if (cap <= 0) next
-      
       take <- min(cap, remaining)
       if (take > 0) {
-        tiers_k_alloc[[tr]][kk] <- tiers_k_alloc[[tr]][kk] + take
+        per_tier_k[[tr]][kk] <- per_tier_k[[tr]][kk] + take
         remaining <- remaining - take
-        # Append 'take' copies of this marginal to the sequence
-        if (slots$marginal[row_i] > 0) {
-          selected_sequence <- c(selected_sequence, rep(slots$marginal[row_i], take))
-        } else {
-          # zeros add nothing; still fill sequence for length correctness
-          selected_sequence <- c(selected_sequence, rep(0, take))
-        }
+        selected_sequence <- c(selected_sequence, rep(slots$marginal[row_i], take))
       }
     }
     
     # Summaries per tier
-    visits_allocated <- sapply(tiers$tier, function(tr) sum(tiers_k_alloc[[tr]]))
+    visits_allocated <- sapply(tiers$tier, function(tr) sum(per_tier_k[[tr]]))
     voters_found <- sapply(tiers$tier, function(tr) {
       mks <- tiers$S[tiers$tier==tr] * r * pow_vec
-      sum(tiers_k_alloc[[tr]] * mks)
+      sum(per_tier_k[[tr]] * mks)
     })
+    
+    # Distributions: exactly n passes per OA
+    pass_distributions <- setNames(vector("list", length(tiers$tier)), tiers$tier)
+    max_passes_used <- setNames(integer(length(tiers$tier)), tiers$tier)
+    avg_passes <- setNames(numeric(length(tiers$tier)), tiers$tier)
+    for (tr in tiers$tier) {
+      ck <- per_tier_k[[tr]]
+      exact <- integer(Kmax+1)  # bins 0..Kmax
+      exact[1] <- tiers$num_oas[tiers$tier==tr] - ck[1]      # exactly 0 passes
+      for (kk in 1:(Kmax-1)) exact[kk+1] <- ck[kk] - ck[kk+1]
+      exact[Kmax+1] <- ck[Kmax]
+      pass_distributions[[tr]] <- exact
+      max_passes_used[tr] <- max(which(exact[-1] > 0), 0)
+      nn <- 0:Kmax
+      if (tiers$num_oas[tiers$tier==tr] > 0) {
+        avg_passes[tr] <- sum(nn * exact) / tiers$num_oas[tiers$tier==tr]
+      } else {
+        avg_passes[tr] <- 0
+      }
+    }
     
     tiers$visits_allocated    <- as.integer(visits_allocated)
     tiers$total_voters_found  <- as.numeric(voters_found)
+    tiers$avg_passes_per_oa   <- as.numeric(avg_passes[tiers$tier])
+    tiers$max_passes_used     <- as.integer(max_passes_used[tiers$tier])
     
     list(
       tiers = tiers,
-      per_tier_k = tiers_k_alloc,
+      pass_distributions = pass_distributions,
       selected_sequence = selected_sequence,
       total_visits_used = sum(visits_allocated),
       total_voters_found = sum(voters_found),
-      status = if (remaining > 0) sprintf("Note: %d visits unallocatable (no marginal benefit left or no capacity).", remaining) else "OK"
+      status = paste0(status_prefix,
+                      if (remaining > 0) sprintf("%d visits unallocatable (no capacity or zero marginal).", remaining) else "OK"),
+      Kmax = Kmax,
+      Otot = Otot
     )
   })
   
-  # Results table
+  # ========================
+  # Outputs (use req(res))
+  # ========================
+  
   output$results_table <- renderDT({
-    res <- optimization_results()
+    res <- optimization_results(); req(res)
     df <- res$tiers
-    df$`Reform Likelihood` <- paste0(round(df$likelihood,1), "%")
-    df$`Visits Allocated`  <- df$visits_allocated
-    df$`Total Reform Voters (expected)` <- round(df$total_voters_found, 1)
+    party <- input$party
     
-    # First-pass return per visit (for reference)
-    first_pass_rpv <- df$S * (input$response_rate/100)
-    df$`First-Pass RPV` <- round(first_pass_rpv, 2)
+    # Pretty distribution like "0:12, 1:95, 2:30, 3:0, ..."
+    dist_str <- vapply(df$tier, function(tr) {
+      exact <- res$pass_distributions[[tr]]
+      paste0(paste0(0:res$Kmax, ":", exact), collapse = ", ")
+    }, character(1))
     
-    out <- df[, c("tier","num_oas","Reform Likelihood","Visits Allocated",
-                  "First-Pass RPV","Total Reform Voters (expected)")]
-    colnames(out)[1:2] <- c("Tier","Number of OAs")
-    datatable(out, options = list(pageLength = 10, dom = 't'))
+    out <- data.frame(
+      Tier = df$tier,
+      `Number of OAs` = df$num_oas,
+      `Support Likelihood` = paste0(round(df$likelihood, 1), "%"),
+      `Visits Allocated (total)` = df$visits_allocated,
+      `Avg Passes/OA` = round(df$avg_passes_per_oa, 2),
+      `Max Passes Used` = df$max_passes_used,
+      `Voters per Visit (First Pass)` = round(df$S * (input$response_rate/100), 2),
+      `Total Voters (expected)` = round(df$total_voters_found, 1),
+      `Pass Distribution (passes:number of OAs)` = dist_str,
+      check.names = FALSE
+    )
+    
+    datatable(
+      out,
+      options = list(pageLength = 10, dom = 't'),
+      caption = tags$caption(
+        style = 'caption-side: top; text-align: left; font-weight:600;',
+        paste("Party:", party)
+      )
+    )
   })
   
-  # Summary
   output$summary_stats <- renderText({
-    res <- optimization_results()
-    eff <- if (input$total_visits > 0) 100*res$total_visits_used/input$total_visits else 0
+    res <- optimization_results(); req(res)
+    party <- input$party
+    eff <- if (input$total_visits > 0) 100 * res$total_visits_used / input$total_visits else 0
+    
+    avg_return_str <- if (res$total_visits_used > 0) {
+      sprintf("%.2f %s voters", res$total_voters_found / res$total_visits_used, party)
+    } else {
+      "0.00"
+    }
+    
     paste0(
       "Status: ", res$status, "\n",
+      "Total OAs (constituency): ", res$Otot, "\n",
+      "Tier OAs sum: ", sum(res$tiers$num_oas), "\n",
       "Total Visits Allocated: ", res$total_visits_used, " / ", input$total_visits, "\n",
-      "Total Reform Voters (expected): ", round(res$total_voters_found, 1), "\n",
-      "Average Return per Visit: ",
-      if (res$total_visits_used > 0) sprintf("%.2f", res$total_voters_found/res$total_visits_used) else "0.00",
-      " voters\n",
+      "Total ", party, " Voters (expected): ", round(res$total_voters_found, 1), "\n",
+      "Average Return per Visit: ", avg_return_str, "\n",
       "Efficiency (Allocated/Available): ", sprintf("%.1f%%", eff)
     )
   })
   
-  # Allocation bar (keep tier colours)
+  # Allocation bar (no label cutoff)
   output$allocation_plot <- renderPlotly({
-    res <- optimization_results()
+    res <- optimization_results(); req(res)
     df <- res$tiers
+    party <- input$party
+    ymax <- if (nrow(df)) max(df$visits_allocated, na.rm = TRUE) else 1
+    pad  <- if (ymax > 0) ymax * 0.2 else 1
+    
     plot_ly(df,
             x = ~tier, y = ~visits_allocated, type = 'bar',
             text = ~paste("Visits:", visits_allocated,
-                          "<br>Expected voters:", round(total_voters_found,1)),
+                          "<br>Expected ", party, " voters:", round(total_voters_found,1),
+                          "<br>Avg passes/OA:", round(avg_passes_per_oa,2)),
             textposition = 'outside',
-            marker = list(color = tier_cols[df$tier])) %>%
-      layout(title = "Visit Allocation by Tier",
+            marker = list(color = tier_cols[df$tier]),
+            cliponaxis = FALSE) %>%
+      layout(title = paste("Visit Allocation by Tier — Party:", party),
              xaxis = list(title = "Tier"),
-             yaxis = list(title = "Number of Visits"),
+             yaxis = list(title = "Number of Visits", range = c(0, ymax + pad)),
+             margin = list(t = 90),
              showlegend = FALSE)
   })
   
-  # First-pass RPV per tier (colours preserved)
+  # First-pass returns per visit (no cutoff)
   output$returns_plot <- renderPlotly({
-    df <- optimization_results()$tiers
+    res <- optimization_results(); req(res)
+    df <- res$tiers
+    party <- input$party
     first_pass_rpv <- df$S * (input$response_rate/100)
+    ymax <- if (length(first_pass_rpv)) max(first_pass_rpv, na.rm = TRUE) else 1
+    pad  <- if (ymax > 0) ymax * 0.2 else 1
+    
     plot_ly(data = data.frame(tier = df$tier, rpv = first_pass_rpv),
             x = ~tier, y = ~rpv, type = 'bar',
-            text = ~paste("First-pass RPV:", round(rpv,2)),
+            text = ~paste("First-pass ", party, " voters/visit:", round(rpv,2)),
             textposition = 'outside',
-            marker = list(color = tier_cols[df$tier])) %>%
-      layout(title = "Expected Reform Voters Discovered on First Visit",
+            marker = list(color = tier_cols[df$tier]),
+            cliponaxis = FALSE) %>%
+      layout(title = paste("Expected ", party, " Voters per Visit (First Pass)", sep = ""),
              xaxis = list(title = "Tier"),
-             yaxis = list(title = "Reform Voters per Visit"),
+             yaxis = list(title = paste(party, " Voters per Visit"),
+                          range = c(0, ymax + pad)),
+             margin = list(t = 90),
              showlegend = FALSE)
   })
   
-  # Marginal sequence actually chosen (global optimal order)
+  # Marginal sequence chosen (global optimal)
   output$marginal_plot <- renderPlotly({
-    seqv <- optimization_results()$selected_sequence
+    res <- optimization_results(); req(res)
+    party <- input$party
+    seqv <- res$selected_sequence
     if (length(seqv) == 0) seqv <- 0
     cumv <- cumsum(seqv)
+    
     plot_ly() %>%
       add_trace(x = seq_along(cumv), y = cumv, type = 'scatter', mode = 'lines',
-                name = 'Cumulative Expected Voters') %>%
+                name = paste("Cumulative Expected", party, "Voters")) %>%
       add_trace(x = seq_along(seqv), y = seqv, type = 'scatter', mode = 'lines',
                 name = 'Marginal per Visit', yaxis = 'y2') %>%
-      layout(title = "Cumulative and Marginal Returns (Optimal Visit Order)",
+      layout(title = paste("Cumulative and Marginal Returns — Party:", party),
              xaxis = list(title = "Visit Number (global)"),
-             yaxis = list(title = "Cumulative Expected Voters"),
+             yaxis = list(title = paste("Cumulative Expected", party, "Voters")),
              yaxis2 = list(title = "Marginal Return", overlaying = 'y', side = 'right'),
              legend = list(x = 0.7, y = 0.9))
   })
