@@ -1,0 +1,12 @@
+name: PAC20_triage
+title: PAC20_triage
+username: namax
+account: namax
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15528764
+bundleId: 10938944
+url: https://namax.shinyapps.io/PAC20_triage/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
